@@ -69,10 +69,11 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
   config :auth_key, validate: :string, required: true
   config :domain, validate: :string, required: true
   config :metadata_filepath,
-         validate: :string, default: '/tmp/cf_logstash_metadata.json', required: false
+         validate: :string, default: '/var/lib/logstash/cf_metadata.json', required: false
   config :poll_time, validate: :number, default: 15, required: false
   config :start_from_secs_ago, validate: :number, default: 1200, required: false
   config :fields, validate: :array, default: DEFAULT_FIELDS, required: false
+  config :poll_interval, validate: :number, default: 120, required: false
 
   public
 
@@ -153,7 +154,7 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
       @logger.info('last_timestamp from previous run detected: '\
                    "#{metadata['last_timestamp']} #{dt_tstamp}")
       params['start_id'] = metadata['last_ray_id']
-      params['end'] = metadata['last_timestamp'].to_i + 120
+      params['end'] = metadata['last_timestamp'].to_i + @poll_interval
       metadata['first_ray_id'] = metadata['last_ray_id']
       metadata['first_timestamp'] = nil
     # not supported by the API yet which is why it's commented out
@@ -168,13 +169,13 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
       @logger.info('last_timestamp from previous run detected: '\
                    "#{metadata['last_timestamp']} #{dt_tstamp}")
       params['start'] = metadata['last_timestamp'].to_i
-      params['end'] = params['start'] + 120
+      params['end'] = params['start'] + @poll_interval
       metadata['first_ray_id'] = nil
       metadata['first_timestamp'] = params['start']
     else
       @logger.info('last_timestamp or last_ray_id from previous run NOT set')
       params['start'] = metadata['default_start_time']
-      params['end'] = params['start'] + 120
+      params['end'] = params['start'] + @poll_interval
       metadata['first_ray_id'] = nil
       metadata['first_timestamp'] = params['start']
     end
@@ -236,7 +237,7 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
         end
         @logger.info(metadata)
         if metadata['first_timestamp']
-          mod_tstamp = metadata['first_timestamp'].to_i + 120
+          mod_tstamp = metadata['first_timestamp'].to_i + @poll_interval
         else
           mod_tstamp = nil
         end
@@ -246,7 +247,7 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
           # received any results in the last batch ... also make sure we
           # only do this if the end date is more than 10 minutes from the
           # current time
-          @logger.info('Incrementing start timestamp by 120 seconds')
+          @logger.info('Incrementing start timestamp by #{@poll_interval} seconds')
           metadata['last_timestamp'] = mod_tstamp
         else # if
           @logger.info("Waiting #{@poll_time} seconds before requesting data"\
