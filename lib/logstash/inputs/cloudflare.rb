@@ -69,13 +69,12 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
   config :auth_key, validate: :string, required: true
   config :domain, validate: :string, required: true
   config :metadata_filepath,
-         validate: :string, default: '/var/lib/logstash/cf_metadata.json', required: false
+         validate: :string, default: '/tmp/cf_logstash_metadata.json', required: false
   config :poll_time, validate: :number, default: 15, required: false
+  config :poll_interval, validate: :number, default: 60, required: false
   config :start_from_secs_ago, validate: :number, default: 1200, required: false
+  config :batch_size, validate: :number, default: 1000, required: false
   config :fields, validate: :array, default: DEFAULT_FIELDS, required: false
-  config :poll_interval, validate: :number, default: 120, required: false
-
-  public
 
   def register
     @host = Socket.gethostname
@@ -110,9 +109,26 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
     end
   end # def write_metadata
 
-  def cloudflare_api_call(endpoint, params, multi_line = false)
+  def _build_uri(endpoint, params)
     uri = URI("https://api.cloudflare.com/client/v4#{endpoint}")
     uri.query = URI.encode_www_form(params)
+    uri
+  end
+
+  def _process_response(response, uri, multi_line)
+    content = response_body(response)
+    if response.code != '200'
+      raise CloudflareAPIError.new(uri.to_s, response, content),
+            'Error calling Cloudflare API'
+    end
+    @logger.info("Received response from Cloudflare API (status_code: #{response.code})")
+    lines = parse_content(content)
+    return lines if multi_line
+    lines[0]
+  end # def _process_response
+
+  def cloudflare_api_call(endpoint, params, multi_line = false)
+    uri = _build_uri(endpoint, params)
     @logger.info('Sending request to Cloudflare')
     Net::HTTP.start(uri.hostname, uri.port, use_ssl: true) do |http|
       request = Net::HTTP::Get.new(
@@ -122,19 +138,12 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
         'X-Auth-Key' => @auth_key
       )
       response = http.request(request)
-      content = response_body(response)
-      if response.code != '200'
-        raise CloudflareAPIError.new(uri.to_s, response, content),
-              'Error calling Cloudflare API'
-      end
-      lines = parse_content(content)
-      return lines if multi_line
-      return lines[0]
+      return _process_response(response, uri, multi_line)
     end
   end # def cloudflare_api_call
 
   def cloudflare_zone_id(domain)
-    params = { status: 'active' }
+    params = { status: 'active', name: domain }
     response = cloudflare_api_call('/zones', params)
     response['result'].each do |zone|
       return zone['id'] if zone['name'] == domain
@@ -142,51 +151,53 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
     raise "No zone with domain #{domain} found"
   end # def cloudflare_zone_id
 
-  def cf_params(metadata)
+  def _from_ray_id(metadata, params)
+    # We have the previous ray ID so we use that and set the batch_size
+    # in order to fetch a certain number of events
+    @logger.info("Previous ray_id detected: #{metadata['last_ray_id']}")
+    params['start_id'] = metadata['last_ray_id']
+    params['count'] = @batch_size
+    metadata['first_ray_id'] = metadata['last_ray_id']
+    metadata['first_timestamp'] = nil
+  end # def _from_ray_id
+
+  def _from_timestamp(metadata, params)
+    # We have the last timestamp so we use it and use the poll_interval
+    dt_tstamp = DateTime.strptime(metadata['last_timestamp'], '%s')
+    @logger.info('last_timestamp from previous run detected: '\
+                 "#{metadata['last_timestamp']} #{dt_tstamp}")
+    params['start'] = metadata['last_timestamp'].to_i
+    params['end'] = params['start'] + @poll_interval
+    metadata['first_ray_id'] = nil
+    metadata['first_timestamp'] = params['start']
+  end # def _from_timestamp
+
+  def _from_neither(metadata, params)
+    @logger.info('last_timestamp or last_ray_id from previous run NOT set')
+    params['start'] = metadata['default_start_time']
+    params['end'] = params['start'] + @poll_interval
+    metadata['first_ray_id'] = nil
+    metadata['first_timestamp'] = params['start']
+  end # def _from_neither
+
+  def cloudflare_params(metadata)
     params = {}
-    # if we have ray_id, we use that as a starting point and and use
-    # timestamp + 120 seconds as end because the API doesn't support the
-    # `count` parameter
-    if metadata['last_ray_id'] && metadata['last_timestamp']
-      dt_tstamp = DateTime.strptime("#{metadata['last_timestamp']}", '%s')
-      @logger.info('last_ray_id from previous run detected: '\
-                   "#{metadata['last_ray_id']}")
-      @logger.info('last_timestamp from previous run detected: '\
-                   "#{metadata['last_timestamp']} #{dt_tstamp}")
-      params['start_id'] = metadata['last_ray_id']
-      params['end'] = metadata['last_timestamp'].to_i + @poll_interval
-      metadata['first_ray_id'] = metadata['last_ray_id']
-      metadata['first_timestamp'] = nil
-    # not supported by the API yet which is why it's commented out
-    # elsif ray_id
-    #   @logger.info("Previous ray_id detected: #{ray_id}")
-    #   params['start_id'] = ray_id
-    #   params['count'] = 100 # not supported in the API yet
-    #   metadata['first_ray_id'] = ray_id
-    #   metadata['first_timestamp'] = nil
+    # if we have ray_id, we use that as a starting point
+    if metadata['last_ray_id']
+      _from_ray_id(metadata, params)
     elsif metadata['last_timestamp']
-      dt_tstamp = DateTime.strptime(metadata['last_timestamp'], '%s')
-      @logger.info('last_timestamp from previous run detected: '\
-                   "#{metadata['last_timestamp']} #{dt_tstamp}")
-      params['start'] = metadata['last_timestamp'].to_i
-      params['end'] = params['start'] + @poll_interval
-      metadata['first_ray_id'] = nil
-      metadata['first_timestamp'] = params['start']
+      _from_timestamp(metadata, params)
     else
-      @logger.info('last_timestamp or last_ray_id from previous run NOT set')
-      params['start'] = metadata['default_start_time']
-      params['end'] = params['start'] + @poll_interval
-      metadata['first_ray_id'] = nil
-      metadata['first_timestamp'] = params['start']
+      _from_neither(metadata, params)
     end
     metadata['last_timestamp'] = nil
     metadata['last_ray_id'] = nil
     params
-  end # def cf_params
+  end # def cloudflare_params
 
   def cloudflare_data(zone_id, metadata)
     @logger.info("cloudflare_data metadata: '#{metadata}'")
-    params = cf_params(metadata)
+    params = cloudflare_params(metadata)
     @logger.info("Using params #{params}")
     begin
       entries = cloudflare_api_call("/zones/#{zone_id}/logs/requests",
@@ -213,50 +224,74 @@ class LogStash::Inputs::Cloudflare < LogStash::Inputs::Base
     end
   end # def fill_cloudflare_data
 
+  def process_entry(queue, metadata, entry)
+    # skip the first ray_id because we already processed it
+    # in the last run
+    return if metadata['first_ray_id'] && \
+              entry['rayId'] == metadata['first_ray_id']
+    event = LogStash::Event.new('host' => @host)
+    fill_cloudflare_data(event, entry)
+    decorate(event)
+    queue << event
+    metadata['last_ray_id'] = entry['rayId']
+    # Cloudflare provides the timestamp in nanoseconds
+    metadata['last_timestamp'] = entry['timestamp'] / 1_000_000_000
+  end # def process_entry
+
+  def _sleep_time
+    @logger.info("Waiting #{@poll_time} seconds before requesting data"\
+                 'from Cloudflare again')
+    # We're staggering the poll_time so we don't block the worker for the whole 15s
+    (@poll_time * 2).times do
+      sleep(0.5)
+    end
+  end
+
+  def continue_or_sleep(metadata)
+    mod_tstamp = metadata['first_timestamp'].to_i + @poll_interval if metadata['first_timestamp']
+    if !metadata['last_timestamp'] && metadata['first_timestamp'] && \
+       mod_tstamp <= metadata['default_start_time']
+      # we need to increment the timestamp by 2 minutes as we haven't
+      # received any results in the last batch ... also make sure we
+      # only do this if the end date is more than 10 minutes from the
+      # current time
+      @logger.info("Incrementing start timestamp by #{@poll_interval} seconds")
+      metadata['last_timestamp'] = mod_tstamp
+    elsif metadata['last_timestamp'] < metadata['default_start_time']
+      # we won't need to sleep as we're trying to catch up
+      return
+    else
+      _sleep_time
+    end
+  end # def continue_or_sleep
+
+  def loop_worker(queue, zone_id)
+    metadata = read_metadata
+    entries = cloudflare_data(zone_id, metadata)
+    @logger.info("Received #{entries.length} events")
+    # if we only fetch one entry the odds are it's the one event that we asked for
+    if entries.length <= 1
+      @logger.info(
+        'Need more than 1 event to process all entries (usually because the 1 event contains the '\
+        'ray_id you asked for')
+      _sleep_time
+      return
+    end
+    entries.each do |entry|
+      process_entry(queue, metadata, entry)
+    end
+    @logger.info(metadata)
+    continue_or_sleep(metadata)
+    write_metadata(metadata)
+  end # def loop_worker
+
   def run(queue)
     @logger.info('Starting cloudflare run')
     zone_id = cloudflare_zone_id(@domain)
     @logger.info("Resolved zone ID #{zone_id} for domain #{@domain}")
     until stop?
       begin
-        metadata = read_metadata
-        entries = cloudflare_data(zone_id, metadata)
-        @logger.info("Received #{entries.length} events")
-        entries.each do |entry|
-          # skip the first ray_id because we already processed it
-          # in the last run
-          next if metadata['first_ray_id'] && \
-                  entry['rayId'] == metadata['first_ray_id']
-          event = LogStash::Event.new('host' => @host)
-          fill_cloudflare_data(event, entry)
-          decorate(event)
-          queue << event
-          metadata['last_ray_id'] = entry['rayId']
-          # Cloudflare provides the timestamp in nanoseconds
-          metadata['last_timestamp'] = entry['timestamp'] / 1_000_000_000
-        end
-        @logger.info(metadata)
-        if metadata['first_timestamp']
-          mod_tstamp = metadata['first_timestamp'].to_i + @poll_interval
-        else
-          mod_tstamp = nil
-        end
-        if !metadata['last_timestamp'] && metadata['first_timestamp'] && \
-           mod_tstamp <= metadata['default_start_time']
-          # we need to increment the timestamp by 2 minutes as we haven't
-          # received any results in the last batch ... also make sure we
-          # only do this if the end date is more than 10 minutes from the
-          # current time
-          @logger.info('Incrementing start timestamp by #{@poll_interval} seconds')
-          metadata['last_timestamp'] = mod_tstamp
-        else # if
-          @logger.info("Waiting #{@poll_time} seconds before requesting data"\
-                       'from Cloudflare again')
-          (@poll_time * 2).times do
-            sleep(0.5)
-          end
-        end
-        write_metadata(metadata)
+        loop_worker(queue, zone_id)
       rescue => exception
         break if stop?
         @logger.error(exception.class)
