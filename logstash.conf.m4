@@ -31,7 +31,7 @@ output {
 }
 filter {
  ruby {
-   code => "event['timestamp_ms'] = event['timestamp'] / 1_000_000"
+   code => "event['timestamp'] /= 1_000_000"
  }
  ruby {
    code => "event['edge_requestTime'] = (event['edge_endTimestamp'] - event['edge_startTimestamp']).to_f / 1_000_000_000"
